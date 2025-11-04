@@ -1,4 +1,4 @@
-# AI Stock Reporter Agent
+# Stock Reporter AI Agent
 
 Automated AI agent that generates **daily investment news reports** for your portfolio companies, analyzes sentiment using an LLM, and sends styled HTML reports via email.
 
