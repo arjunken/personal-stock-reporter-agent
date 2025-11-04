@@ -251,7 +251,7 @@ def analyze_articles_with_groq(groq_client: Groq, model: str, articles: List[Dic
 # ---- Compose markdown report (same as before) ----
 def compose_markdown_report(company_results: Dict[str, List[Dict]]):
     now = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
-    md = [f"# Weekly Holdings Report — {now}\n"]
+    md = [f"# Daily Holdings Report — {now}\n"]
     for company, analyses in company_results.items():
         md.append(f"## {company}\n")
         if not analyses:
@@ -373,17 +373,17 @@ def main():
 
     # save local copy
     ts = datetime.now().strftime("%Y%m%d_%H%M")
-    fname = f"weekly_report_{ts}.md"
+    fname = f"daily_report_{ts}.md"
     with open(fname, "w", encoding="utf-8") as f:
         f.write(report_md)
     print(f"Saved report to {fname}")
 
     # Build HTML
-    email_html = render_html_from_markdown(report_md, title=f"Weekly Holdings Report — {datetime.now().strftime('%Y-%m-%d')}")
+    email_html = render_html_from_markdown(report_md, title=f"Daily Holdings Report — {datetime.now().strftime('%Y-%m-%d')}")
 
     # send via Resend if configured
     if resend_key and email_from and email_to:
-        subj = f"Weekly Holdings Report — {datetime.now().strftime('%Y-%m-%d')}"
+        subj = f"Daily Holdings Report — {datetime.now().strftime('%Y-%m-%d')}"
         resp = send_report_via_resend(resend_key, subj, email_html, email_from, email_to)
         print("Resend response:", resp)
     else:
