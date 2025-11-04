@@ -1,0 +1,8 @@
+feedparser
+requests
+python-dotenv
+groq
+resend
+tqdm
+markdown
+jinja2
