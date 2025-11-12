@@ -25,14 +25,14 @@ jobs:
 
       - name: Run agent
         env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           MAX_ARTICLES_PER_COMPANY: ${{ secrets.MAX_ARTICLES_PER_COMPANY }}
           DAYS_LOOKBACK: ${{ secrets.DAYS_LOOKBACK }}
-          GROQ_MODEL: ${{ secrets.GROQ_MODEL }}
+          OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
         run: |
           python agent.py
 
