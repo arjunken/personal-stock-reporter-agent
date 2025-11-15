@@ -167,23 +167,41 @@ def google_news_rss_query(query: str, days_back: int=7, max_items: int=5):
     return entries
 
 def fetch_news_for_company(company_entry: str, finnhub_api_key: str, days_back: int=7, max_items: int=5):
+    """
+    High level: resolve symbol if needed, then call Finnhub.
+    If Finnhub returns an error OR returns an empty list, fall back to Google News RSS.
+    This prevents empty reports when Finnhub returns no recent items for the symbol.
+    """
+    # Try Finnhub first if API key is present
     if finnhub_api_key:
         symbol = resolve_symbol_via_finnhub(company_entry, finnhub_api_key)
         if symbol:
-            articles = finnhub_company_news(symbol, days_back=days_back, max_items=max_items, finnhub_api_key=finnhub_api_key)
+            try:
+                articles = finnhub_company_news(symbol, days_back=days_back, max_items=max_items, finnhub_api_key=finnhub_api_key)
+            except Exception as e:
+                print(f"Finnhub fetch raised an exception for {symbol}: {e}. Falling back to RSS.")
+                articles = None
+
+            # Treat empty list as a signal to fallback to RSS
             if articles:
+                print(f"Fetched {len(articles)} articles from Finnhub for {symbol}.")
                 return articles
             else:
-                print(f"Finnhub returned no articles for symbol {symbol}, falling back to RSS for '{company_entry}'.")
+                print(f"Finnhub returned no articles for symbol {symbol} (or error). Falling back to Google News RSS for '{company_entry}'.")
         else:
             print(f"Could not resolve symbol for '{company_entry}' via Finnhub; falling back to RSS.")
     else:
         print("No FINNHUB_API_KEY provided — using Google News RSS fallback.")
+
+    # Fallback: google RSS search
     try:
-        return google_news_rss_query(company_entry, days_back=days_back, max_items=max_items)
+        rss_articles = google_news_rss_query(company_entry, days_back=days_back, max_items=max_items)
+        print(f"Fetched {len(rss_articles)} articles from Google News RSS for '{company_entry}'.")
+        return rss_articles
     except Exception as e:
         print("Fallback RSS fetch error:", e)
         return []
+
 
 # ---- Deduplicate by link/title ----
 def dedupe_articles(list_of_entries: List[Dict]):
