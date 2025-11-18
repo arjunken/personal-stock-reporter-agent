@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-agent.py (HTML email version) — OpenRouter edition
+agent.py (HTML email version) — OpenRouter edition (reworked)
 - Fetches news (Finnhub or Google RSS fallback)
-- Calls OpenRouter (openrouter/polaris-alpha) to analyze articles into JSON
-- Persists an optional markdown file, renders styled HTML via Jinja2, and sends via Resend
+- Calls OpenRouter (if configured) to analyze articles into JSON
+- Persists a markdown file, renders styled HTML via Jinja2, and sends via Resend
 - Timezone-aware guard for 14:00 America/Vancouver with --force override for local testing
 """
 
@@ -166,11 +166,27 @@ def google_news_rss_query(query: str, days_back: int=7, max_items: int=5):
             break
     return entries
 
+def _articles_have_useful_content(articles):
+    """
+    Return True if articles is a non-empty list and contains at least one
+    article with a non-empty title or link.
+    """
+    if not articles or not isinstance(articles, list):
+        return False
+    for a in articles:
+        if not isinstance(a, dict):
+            continue
+        title = (a.get("title") or "").strip()
+        link = (a.get("link") or "").strip()
+        if title or link:
+            return True
+    return False
+
 def fetch_news_for_company(company_entry: str, finnhub_api_key: str, days_back: int=7, max_items: int=5):
     """
-    High level: resolve symbol if needed, then call Finnhub.
-    If Finnhub returns an error OR returns an empty list, fall back to Google News RSS.
-    This prevents empty reports when Finnhub returns no recent items for the symbol.
+    Try Finnhub first. If Finnhub returns nothing useful (empty list, or list of empty items),
+    fall back to Google News RSS.
+    Returns a tuple: (articles_list, source_string) where source_string is "finnhub" or "rss".
     """
     # Try Finnhub first if API key is present
     if finnhub_api_key:
@@ -179,29 +195,33 @@ def fetch_news_for_company(company_entry: str, finnhub_api_key: str, days_back: 
             try:
                 articles = finnhub_company_news(symbol, days_back=days_back, max_items=max_items, finnhub_api_key=finnhub_api_key)
             except Exception as e:
-                print(f"Finnhub fetch raised an exception for {symbol}: {e}. Falling back to RSS.")
+                print(f"[fetch_news] Finnhub error for {symbol}: {e} → falling back to RSS")
                 articles = None
 
-            # Treat empty list as a signal to fallback to RSS
-            if articles:
-                print(f"Fetched {len(articles)} articles from Finnhub for {symbol}.")
-                return articles
+            # If articles is truthy and contains at least one useful item, use it.
+            if _articles_have_useful_content(articles):
+                print(f"[fetch_news] Using Finnhub for {company_entry} (symbol={symbol}) — {len(articles)} items")
+                # return shallow copy to avoid accidental mutation
+                return list(articles)[:max_items], "finnhub"
             else:
-                print(f"Finnhub returned no articles for symbol {symbol} (or error). Falling back to Google News RSS for '{company_entry}'.")
+                print(f"[fetch_news] Finnhub returned no useful articles for {symbol} — falling back to RSS")
         else:
-            print(f"Could not resolve symbol for '{company_entry}' via Finnhub; falling back to RSS.")
+            print(f"[fetch_news] Could not resolve symbol for '{company_entry}' via Finnhub; falling back to RSS.")
     else:
-        print("No FINNHUB_API_KEY provided — using Google News RSS fallback.")
+        print("[fetch_news] No FINNHUB_API_KEY provided — using Google News RSS fallback.")
 
     # Fallback: google RSS search
     try:
         rss_articles = google_news_rss_query(company_entry, days_back=days_back, max_items=max_items)
-        print(f"Fetched {len(rss_articles)} articles from Google News RSS for '{company_entry}'.")
-        return rss_articles
+        if _articles_have_useful_content(rss_articles):
+            print(f"[fetch_news] Using Google News RSS for '{company_entry}' — {len(rss_articles)} items")
+            return list(rss_articles)[:max_items], "rss"
+        else:
+            print(f"[fetch_news] Google News RSS returned no useful articles for '{company_entry}'.")
+            return [], "none"
     except Exception as e:
-        print("Fallback RSS fetch error:", e)
-        return []
-
+        print(f"[fetch_news] Fallback RSS fetch error for '{company_entry}': {e}")
+        return [], "none"
 
 # ---- Deduplicate by link/title ----
 def dedupe_articles(list_of_entries: List[Dict]):
@@ -214,25 +234,6 @@ def dedupe_articles(list_of_entries: List[Dict]):
         seen.add(key)
         out.append(e)
     return out
-
-# ---- Prompt builder (ask for JSON) ----
-def prepare_prompt_for_article(article):
-    title = article.get('title') or ''
-    snippet = article.get('summary') or ''
-    prompt = f"""
-You are a concise investor-facing analyst. Given the article title and snippet, produce JSON with these keys:
-- summary: 2-3 sentence factual executive summary.
-- sentiment: one of "Positive", "Neutral", "Negative", with one short reason.
-- watch: one short suggested next step or watchpoint for an investor.
-
-Article title: {title}
-Article snippet: {snippet}
-
-Return ONLY valid JSON similar to:
-{{ "summary": "…", "sentiment": "Positive — reason", "watch": "..." }}
-If you cannot determine a field, return an empty string for that field.
-"""
-    return prompt
 
 # ---- OpenRouter analysis  ----
 def get_openrouter_config():
@@ -250,81 +251,157 @@ def _extract_text_from_openrouter_choice(choice: dict) -> str:
             return str(content)
     return content if content is not None else ""
 
+def _local_simple_analysis(title: str, snippet: str) -> Dict[str, str]:
+    """
+    Deterministic simple fallback: construct a minimal summary/sentiment/watch
+    so that the report has content even if the LLM is unavailable.
+    """
+    text = (title or "") + (" — " + snippet if snippet else "")
+    summary = text[:280] + ("…" if len(text) > 280 else "")
+    # very naive sentiment: look for positive/negative words
+    pos_words = ["beat", "beats", "growth", "surge", "record", "upgrade", "positive", "gain"]
+    neg_words = ["miss", "missed", "down", "fall", "cut", "delay", "recall", "negative", "loss"]
+    lower = text.lower()
+    sentiment = "Neutral — no clear signal"
+    for w in pos_words:
+        if w in lower:
+            sentiment = "Positive — contains positive signal"
+            break
+    for w in neg_words:
+        if w in lower:
+            sentiment = "Negative — contains negative signal"
+            break
+    watch = "Monitor for follow-up coverage and official company statements."
+    return {"summary": summary, "sentiment": sentiment, "watch": watch}
+
 def analyze_articles_with_openrouter(articles: List[Dict]) -> List[Dict]:
+    """
+    Returns a list of {"article": <article>, "analysis": <parsed dict>} entries.
+    - Attempts to call OpenRouter for each article (if API key present).
+    - Robust parsing: extracts JSON blob from response and verifies keys.
+    - Retries once with a clarification prompt if parsing fails.
+    - If OpenRouter is unavailable or returns non-parseable text, falls back to local simple analysis.
+    - Writes debug output to DEBUG_RESPONSES_PATH for later inspection.
+    """
     api_key, model = get_openrouter_config()
     headers = {
-        "Authorization": f"Bearer {api_key}" if api_key else "",
         "Content-Type": "application/json",
     }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     results = []
     debug_out = []
 
+    json_schema_example = (
+        '{\n'
+        '  "summary": "Two- to three-sentence factual summary of the article.",\n'
+        '  "sentiment": "Positive — short reason OR Neutral — short reason OR Negative — short reason",\n'
+        '  "watch": "One-line suggested next step or watchpoint for an investor."\n'
+        '}'
+    )
+
     for art in articles:
-        prompt = prepare_prompt_for_article(art)
-        messages = [
-            {"role": "system", "content": "You are an expert investor-facing summarization assistant."},
-            {"role": "user", "content": prompt}
-        ]
-        body = {
-            "model": model,
-            "messages": messages,
-            "extra_body": {"reasoning": {"enabled": True}},
-            # "max_tokens": 400,
-            # "temperature": 0.0
-        }
-
-        try:
-            resp = requests.post(OPENROUTER_API_URL, headers=headers, data=json.dumps(body), timeout=60)
-            resp.raise_for_status()
-            resp_json = resp.json()
-        except Exception as e:
-            parsed = {"error": f"openrouter_http_error: {str(e)}"}
-            results.append({"article": art, "analysis": parsed})
-            debug_out.append({"article_title": art.get("title"), "error": str(e)})
-            time.sleep(0.2)
-            continue
-
-        choices = resp_json.get("choices") or []
-        if not choices:
-            parsed = {"error": "no_choices_returned", "raw": resp_json}
-            results.append({"article": art, "analysis": parsed})
-            debug_out.append({"article_title": art.get("title"), "raw_response": resp_json})
-            time.sleep(0.2)
-            continue
-
-        choice = choices[0]
-        text = _extract_text_from_openrouter_choice(choice)
-        debug_out.append({"article_title": art.get("title"), "raw_text": text, "raw_choice": choice})
-
-        # try to pull reasoning_details if present
-        reasoning = None
-        try:
-            msg = choice.get("message", {})
-            reasoning = msg.get("reasoning_details")
-        except Exception:
-            reasoning = None
-
-        # parse JSON from text
+        title = art.get("title") or ""
+        snippet = art.get("summary") or ""
         parsed = None
-        try:
-            m = re.search(r"\{.*\}", text, re.DOTALL)
-            json_text = m.group(0) if m else text
-            parsed = json.loads(json_text)
-        except Exception as e_parse:
-            parsed = {"raw": text, "parse_error": str(e_parse)}
-            if reasoning:
-                parsed["_reasoning_details"] = reasoning
+        raw_text = ""
+        attempt = 0
+        max_attempts = 2
+
+        # If no API key, skip calling OpenRouter and use local fallback
+        if not api_key:
+            parsed = _local_simple_analysis(title, snippet)
+            debug_out.append({"title": title, "attempt": 0, "source": "local_fallback", "parsed": parsed})
+            results.append({"article": art, "analysis": parsed})
+            continue
+
+        while attempt < max_attempts and parsed is None:
+            attempt += 1
+            user_prompt = f"""
+You are a concise investor-facing analyst.
+
+Given the article title and snippet, return ONLY valid JSON that matches this schema (no extra commentary):
+
+{json_schema_example}
+
+Article title: {title}
+Article snippet: {snippet}
+
+Rules:
+1) Return only the JSON object and nothing else.
+2) If you cannot determine a field, return an empty string for that field.
+3) Be brief and factual.
+"""
+            body = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "You are an expert investor-facing summarization assistant."},
+                    {"role": "user", "content": user_prompt}
+                ],
+                "temperature": 0.0,
+                "max_tokens": 600
+            }
+
+            try:
+                resp = requests.post(OPENROUTER_API_URL, headers=headers, data=json.dumps(body), timeout=60)
+                resp.raise_for_status()
+                resp_json = resp.json()
+            except Exception as e:
+                raw_text = f"openrouter_http_error: {e}"
+                debug_out.append({"title": title, "attempt": attempt, "error": raw_text})
+                # on HTTP error, break out and fall back to local
+                break
+
+            # Extract content from choices
+            choices = resp_json.get("choices") or []
+            choice = choices[0] if choices else {}
+            raw_text = _extract_text_from_openrouter_choice(choice) or ""
+            # try to extract JSON object from raw_text
+            parsed_candidate = None
+            parse_error = None
+            try:
+                m = re.search(r"\{[\s\S]*\}", raw_text)
+                json_text = m.group(0) if m else raw_text
+                parsed_candidate = json.loads(json_text)
+            except Exception as e_parse:
+                parse_error = str(e_parse)
+                parsed_candidate = None
+
+            # Validate parsed_candidate has required keys
+            if isinstance(parsed_candidate, dict):
+                has_keys = all(k in parsed_candidate for k in ("summary", "sentiment", "watch"))
+                if has_keys:
+                    parsed = parsed_candidate
+                    debug_out.append({"title": title, "attempt": attempt, "raw_text": raw_text, "parsed": parsed_candidate, "parse_error": parse_error})
+                    break
+
+            # Not parsed successfully
+            debug_out.append({"title": title, "attempt": attempt, "raw_text": raw_text, "parsed": parsed_candidate, "parse_error": parse_error})
+
+            # If we still have attempt left, send a short clarification asking for JSON only
+            if attempt < max_attempts:
+                clarification_prompt = f"""Previous assistant response (shown above) could not be parsed as JSON. Please return ONLY a JSON object that matches the schema below, with keys "summary","sentiment","watch". If unknown, use empty strings.
+
+{json_schema_example}
+
+Quote your JSON only."""
+                body["messages"].append({"role": "user", "content": clarification_prompt})
+                # loop to retry
+
+        # End attempts
+        if parsed is None:
+            # fallback to local simple analysis
+            parsed = _local_simple_analysis(title, snippet)
+            debug_out.append({"title": title, "attempt": attempt, "source": "fallback_local", "parsed": parsed, "last_raw": raw_text})
 
         results.append({"article": art, "analysis": parsed})
-        time.sleep(0.2)
 
-    # write debug_out to artifact file for CI debugging (optional)
+    # persist debug file
     try:
         DEBUG_RESPONSES_PATH.write_text(json.dumps(debug_out, indent=2, ensure_ascii=False))
-        print(f"Wrote debug responses to {DEBUG_RESPONSES_PATH}")
-    except Exception:
-        pass
+    except Exception as e:
+        print("Could not write debug responses:", e)
 
     return results
 
@@ -338,6 +415,7 @@ def compose_markdown_report(company_results: Dict[str, List[Dict]]):
             md.append("_No recent articles found._\n")
             continue
         for idx, item in enumerate(analyses, start=1):
+            # item should be {"article": {...}, "analysis": {...}}
             a = item.get('article') or {}
             an = item.get('analysis') or {}
             title = a.get('title') or "No title"
@@ -420,49 +498,97 @@ def main():
 
     email_to = parse_email_to_list(email_to_raw)
 
+    # NOTE: we will allow missing OPENROUTER_API_KEY and use the local fallback,
+    # but prefer you set it for higher-quality summaries.
     if not openrouter_key:
-        raise RuntimeError("OPENROUTER_API_KEY environment variable is required.")
+        print("Warning: OPENROUTER_API_KEY not set — using local fallback analysis (less accurate).")
 
     companies = load_companies()
     company_results = {}
-
     for comp in tqdm(companies, desc="Companies"):
         finnhub_key = get_env("FINNHUB_API_KEY")
-        entries = fetch_news_for_company(comp, finnhub_key, days_back=days_back, max_items=max_articles*2)
+        # fetch returns (articles, source)
+        try:
+            entries, source = fetch_news_for_company(comp, finnhub_key, days_back=days_back, max_items=max_articles*2)
+        except Exception as e:
+            print(f"[main] fetch_news_for_company raised for {comp}: {e}")
+            entries, source = [], "error"
+
+        # Defensive: ensure entries is a list
+        if not isinstance(entries, list):
+            print(f"[main] Warning: entries for {comp} is not a list (type={type(entries)}). Forcing empty list.")
+            entries = []
+
+        # log sample titles for debugging
+        try:
+            sample_titles = [ (e.get("title") or e.get("summary") or "")[:120] for e in entries[:3] if isinstance(e, dict) ]
+            print(f"[main] {comp} — source={source} — fetched {len(entries)} articles; samples: {sample_titles}")
+        except Exception as e:
+            print(f"[main] {comp} — source={source} — fetched {len(entries)} articles (could not list samples): {e}")
+
         entries = dedupe_articles(entries)[:max_articles]
         if not entries:
             company_results[comp] = []
             continue
 
-        # use OpenRouter analysis
+        # analyze returns list of {"article":..., "analysis":...}
         analyses = analyze_articles_with_openrouter(entries)
         company_results[comp] = analyses
 
-    report_md = compose_markdown_report(company_results)
-
     # save local copy (optional)
+    try:
+        num_companies = len(company_results)
+        print(f"[main] Processed {num_companies} companies.")
+        sample = list(company_results.keys())[:6]
+        print(f"[main] Sample companies: {sample}")
+    except Exception:
+        print("[main] Could not inspect company_results for debugging.")
+
+    # Try to compose the markdown report; if that fails produce a safe fallback
+    try:
+        report_md = compose_markdown_report(company_results)
+    except Exception as e:
+        print("ERROR composing markdown report:", str(e))
+        try:
+            Path("debug_company_results.json").write_text(json.dumps(company_results, indent=2, ensure_ascii=False))
+            print("Wrote debug_company_results.json for inspection.")
+        except Exception as e2:
+            print("Also failed to write debug_company_results.json:", e2)
+        report_md = "# Report generation failed\n\nThere was an error composing the report. See debug_company_results.json for details."
+
+    # Optionally save markdown (original behaviour; may fail on permission issues)
     ts = datetime.now().strftime("%Y%m%d_%H%M")
     fname = f"daily_report_{ts}.md"
     try:
         with open(fname, "w", encoding="utf-8") as f:
             f.write(report_md)
         print(f"Saved report to {fname}")
-    except Exception:
-        print("Skipping saving markdown report (could not write file).")
+    except Exception as e:
+        print("Skipping saving markdown report (could not write file):", str(e))
 
-    # Build HTML
-    email_html = render_html_from_markdown(report_md, title=f"Daily Holdings Report — {datetime.now().strftime('%Y-%m-%d')}")
+    # Build HTML from (possibly fallback) markdown
+    try:
+        email_html = render_html_from_markdown(report_md, title=f"Daily Holdings Report — {datetime.now().strftime('%Y-%m-%d')}")
+    except Exception as e:
+        print("ERROR rendering HTML from markdown:", str(e))
+        email_html = f"<html><body><h1>Daily Holdings Report</h1><pre>{str(report_md)[:1000]}</pre><p>Rendering error: {e}</p></body></html>"
 
     # send via Resend if configured
     if resend_key and email_from and email_to:
         subj = f"Daily Holdings Report — {datetime.now().strftime('%Y-%m-%d')}"
-        resp = send_report_via_resend(resend_key, subj, email_html, email_from, email_to)
-        print("Resend response:", resp)
+        try:
+            resp = send_report_via_resend(resend_key, subj, email_html, email_from, email_to)
+            print("Resend response:", resp)
+        except Exception as e:
+            print("Error sending via Resend:", str(e))
     else:
         print("Resend not configured or EMAIL_FROM/EMAIL_TO missing; skipping send. You can preview HTML in local file 'preview_report.html'.")
-        with open("preview_report.html", "w", encoding="utf-8") as f:
-            f.write(email_html)
-        print("Saved preview_report.html for inspection.")
+        try:
+            with open("preview_report.html", "w", encoding="utf-8") as f:
+                f.write(email_html)
+            print("Saved preview_report.html for inspection.")
+        except Exception as e:
+            print("Could not save preview_report.html:", e)
 
 if __name__ == "__main__":
     main()
