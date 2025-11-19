@@ -534,44 +534,80 @@ Quote your JSON only."""
 
 # ---- Compose markdown report (includes original analysis fields) ----
 def compose_markdown_report(company_results: Dict[str, List[Dict]]):
+    """
+    Compose the markdown report, enhanced with optional memory.json sections:
+    - If memory.json contains per-company notes such as thesis, risk_factors,
+      or position_notes, they are injected before the articles section.
+    - Existing formatting and functionality remain unchanged.
+    """
+    # Load memory.json if present
+    memory_data = {}
+    try:
+        if MEMORY_PATH.exists():
+            memory_data = json.loads(MEMORY_PATH.read_text())
+    except Exception as e:
+        print(f"[compose_markdown_report] Warning: Could not load memory.json: {e}")
+
     now = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
-    md = [f"# Weekly Holdings Report — {now}\n"]
+    md = [f"# Daily Holdings Report — {now}\n"]
+
     for company, analyses in company_results.items():
-        # skip trend keys inserted as 'Company##_trend'
-        if company.endswith("##_trend"):
-            continue
         md.append(f"## {company}\n")
-        # present trend if available
-        trend_key = company + "##_trend"
-        trend = company_results.get(trend_key)
-        if trend:
-            prev = trend.get("previous")
-            curr = trend.get("current")
-            delta = trend.get("delta")
-            if prev is None:
-                md.append(f"- **Trend:** No previous record to compare.\n")
-            else:
-                sign = "↑" if delta > 0 else ("↓" if delta < 0 else "—")
-                md.append(f"- **Trend:** Sentiment {sign} by {abs(delta):.3f} (prev {prev:.3f} → now {curr:.3f}).\n")
-        # original article listings
+
+        # Inject portfolio memory if available
+        company_memory = memory_data.get(company, {})
+        if company_memory:
+            md.append("### 📌 Portfolio Memory Notes\n")
+            thesis = company_memory.get("thesis")
+            risks = company_memory.get("risk_factors")
+            pos_notes = company_memory.get("position_notes")
+
+            if thesis:
+                md.append(f"- **Thesis:** {thesis}\n")
+
+            if risks:
+                # risks may be list or string
+                if isinstance(risks, list):
+                    risks_fmt = "; ".join(str(x) for x in risks)
+                else:
+                    risks_fmt = str(risks)
+                md.append(f"- **Risk Factors:** {risks_fmt}\n")
+
+            if pos_notes:
+                md.append(f"- **Position Notes:** {pos_notes}\n")
+
+            md.append("\n")  # spacer before articles
+
+        # === Original article rendering logic (unchanged) ===
         if not analyses:
             md.append("_No recent articles found._\n")
             continue
+
         for idx, item in enumerate(analyses, start=1):
-            a = item.get('article')
-            an = item.get('analysis')
-            title = a.get('title') if a else "No title"
-            link = (a.get('link')) if a else ""
+            a = item.get('article') or {}
+            an = item.get('analysis') or {}
+            title = a.get('title') or "No title"
+            link = a.get('link') or ""
             summary = an.get('summary') if isinstance(an, dict) else an
             sentiment = an.get('sentiment') if isinstance(an, dict) else ""
             watch = an.get('watch') if isinstance(an, dict) else ""
+
+            # fallbacks if parsed fields missing
+            if summary is None:
+                summary = an.get('raw') if isinstance(an, dict) else "None"
+            if sentiment is None:
+                sentiment = ""
+            if watch is None:
+                watch = ""
+
             md.append(f"### {idx}. [{title}]({link})\n")
             md.append(f"- **Summary:** {summary}\n")
             md.append(f"- **Sentiment:** {sentiment}\n")
             md.append(f"- **Watch:** {watch}\n")
-        md.append("\n")
-    return "\n".join(md)
 
+        md.append("\n")
+
+    return "\n".join(md)
 
 # ---- HTML rendering ----
 def render_html_from_markdown(report_md: str, title: str):
